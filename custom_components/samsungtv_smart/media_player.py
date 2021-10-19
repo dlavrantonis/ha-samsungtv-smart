@@ -90,6 +90,7 @@ from .const import (
     CONF_LOGO_OPTION,
     DATA_OPTIONS,
     DEFAULT_APP,
+    DEFAULT_PORT,
     DEFAULT_POWER_ON_DELAY,
     DEFAULT_SOURCE_LIST,
     DEFAULT_TIMEOUT,
@@ -106,8 +107,6 @@ from .const import (
 from .logo import LOGO_OPTION_DEFAULT, Logo
 
 ATTR_ART_MODE_STATUS = "art_mode_status"
-ATTR_DEVICE_MODEL = "device_model"
-ATTR_DEVICE_NAME = "device_name"
 ATTR_IP_ADDRESS = "ip_address"
 ATTR_PICTURE_MODE = "picture_mode"
 ATTR_REMOTE_KEY = "key_id"
@@ -190,8 +189,8 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         if value:
             config[attr] = value
 
-    hostname = config.get(CONF_HOST)
-    port = config.get(CONF_PORT)
+    hostname = config[CONF_HOST]
+    port = config.get(CONF_PORT, DEFAULT_PORT)
     token_file = get_token_file(hass, hostname, port)
     logo_file = hass.config.path(STORAGE_DIR, f"{DOMAIN}_logo_paths")
 
@@ -224,7 +223,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         "Samsung TV %s:%d added as '%s'",
         hostname,
         port,
-        config.get(CONF_NAME),
+        config.get(CONF_NAME, hostname),
     )
 
 
@@ -234,29 +233,35 @@ class SamsungTVDevice(MediaPlayerEntity):
     def __init__(self, config, entry_id, session: ClientSession, token_file, logo_file):
         """Initialize the Samsung device."""
 
+        self._entry_id = entry_id
+        self._session = session
+        self._host = config[CONF_HOST]
+        self._mac = config.get(CONF_MAC)
+
         # Set entity attributes
-        self._attr_name = config.get(CONF_NAME)
-        self._attr_unique_id = config.get(CONF_ID)
+        self._attr_name = config.get(CONF_NAME, self._host)
+        self._attr_unique_id = config.get(CONF_ID, entry_id)
         self._attr_icon = "mdi:television"
         self._attr_device_class = DEVICE_CLASS_TV
         self._attr_supported_features = SUPPORT_SAMSUNGTV_SMART
         self._attr_media_title = None
         self._attr_media_image_url = None
 
-        # Save a reference to the imported classes
-        self._entry_id = entry_id
-        self._session = session
-        self._host = config.get(CONF_HOST)
-        self._mac = config.get(CONF_MAC)
-        self._device_name = config.get(CONF_DEVICE_NAME)
-        self._device_model = config.get(CONF_DEVICE_MODEL)
-        self._device_os = config.get(CONF_DEVICE_OS)
-        self._broadcast = config.get(CONF_BROADCAST_ADDRESS)
-        self._timeout = config.get(CONF_TIMEOUT, DEFAULT_TIMEOUT)
+        self._attr_device_info = {
+            ATTR_IDENTIFIERS: {(DOMAIN, self._attr_unique_id)},
+            ATTR_NAME: self._attr_name,
+        }
+        self._attr_device_info.update(
+            self._get_add_dev_info(
+                config.get(CONF_DEVICE_MODEL),
+                config.get(CONF_DEVICE_NAME),
+                config.get(CONF_DEVICE_OS),
+                self._mac,
+            )
+        )
 
-        port = config.get(CONF_PORT)
-        api_key = config.get(CONF_API_KEY, None)
-        device_id = config.get(CONF_DEVICE_ID, None)
+        # Save a reference to the imported config
+        self._broadcast = config.get(CONF_BROADCAST_ADDRESS)
 
         # load sources list
         self._default_source_used = False
@@ -308,13 +313,13 @@ class SamsungTVDevice(MediaPlayerEntity):
         self._st_conn_error_count = 0
 
         ws_name = config.get(CONF_WS_NAME, self._attr_name)
+        ws_port = config.get(CONF_PORT, DEFAULT_PORT)
+        ws_timeout = config.get(CONF_TIMEOUT, DEFAULT_TIMEOUT)
         self._ws = SamsungTVWS(
-            name=WS_PREFIX
-            + " "
-            + ws_name,  # this is the name shown in the TV list of external device.
+            name=f"{WS_PREFIX} {ws_name}",  # this is the name shown in the TV list of external device.
             host=self._host,
-            port=port,
-            timeout=self._timeout,
+            port=ws_port,
+            timeout=ws_timeout,
             key_press_delay=KEYPRESS_DEFAULT_DELAY,
             token_file=token_file,
             app_list=self._app_list,
@@ -323,6 +328,8 @@ class SamsungTVDevice(MediaPlayerEntity):
         self._upnp = upnp(host=self._host, session=session)
 
         self._st = None
+        api_key = config.get(CONF_API_KEY)
+        device_id = config.get(CONF_DEVICE_ID)
         if api_key and device_id:
             self._st = SmartThingsTV(
                 api_key=api_key,
@@ -492,6 +499,20 @@ class SamsungTVDevice(MediaPlayerEntity):
                 data[ATTR_PICTURE_MODE_LIST] = picture_mode_list
 
         return data
+
+    @staticmethod
+    def _get_add_dev_info(dev_model, dev_name, dev_os, dev_mac):
+        dev_info = {ATTR_MANUFACTURER: "Samsung Electronics"}
+        model = dev_model or "Samsung TV"
+        if dev_name:
+            model = f"{model} ({dev_name})"
+        dev_info[ATTR_MODEL] = model
+        if dev_os:
+            dev_info[ATTR_SW_VERSION] = dev_os
+        if dev_mac:
+            dev_info["connections"] = {(CONNECTION_NETWORK_MAC, dev_mac)}
+
+        return dev_info
 
     @staticmethod
     def _load_param_list(src_list):
@@ -1413,6 +1434,27 @@ class SamsungTVDevice(MediaPlayerEntity):
         if not self._st:
             raise NotImplementedError()
         await self._st.async_set_picture_mode(picture_mode)
+
+    @property
+    def extra_state_attributes(self):
+        """Return the optional state attributes."""
+        data = {
+            ATTR_IP_ADDRESS: self._host
+        }
+        if self._ws.artmode_status != ArtModeStatus.Unsupported:
+            status_on = self._ws.artmode_status == ArtModeStatus.On
+            data.update({
+                ATTR_ART_MODE_STATUS: STATE_ON if status_on else STATE_OFF
+            })
+        if self._st:
+            picture_mode = self._st.picture_mode
+            picture_mode_list = self._st.picture_mode_list
+            if picture_mode:
+                data[ATTR_PICTURE_MODE] = picture_mode
+            if picture_mode_list:
+                data[ATTR_PICTURE_MODE_LIST] = picture_mode_list
+
+        return data
 
     async def async_will_remove_from_hass(self):
         """Run when entity will be removed from hass."""
