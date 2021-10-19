@@ -69,6 +69,7 @@ RESULT_WRONG_APIKEY = "wrong_api_key"
 
 SERVICE_SELECT_PICTURE_MODE = "select_picture_mode"
 SERVICE_SET_ART_MODE = "set_art_mode"
+SERVICE_REMOTE_KEY = "remote_key"
 
 STD_APP_LIST = {
     # app_id: smartthings app id (if different and available)

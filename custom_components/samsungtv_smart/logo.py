@@ -39,7 +39,7 @@ LOGO_BASE_URL = "https://jaruba.github.io/channel-logos/"
 LOGO_FILE = "logo_paths.json"
 LOGO_FILE_DOWNLOAD = "logo_paths_download.json"
 LOGO_FILE_DAYS_BEFORE_UPDATE = 1
-LOGO_MIN_SCORE_REQUIRED = 80
+LOGO_MIN_SCORE_REQUIRED = 50
 LOGO_MEDIATITLE_KEYWORD_REMOVAL = ["HDTV", "HD"]
 LOGO_MAX_PATHS = 30000
 

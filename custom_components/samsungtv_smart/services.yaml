@@ -30,3 +30,22 @@ set_art_mode:
       selector:
         entity:
           integration: samsungtv_smart
+
+remote_key:
+  description: Send the media player a remote control command
+  fields:
+    entity_id:
+      name: Entity Name
+      description: Name of the target entity
+      required: true
+      example: "media_player.tv"
+      selector:
+        entity:
+          integration: samsungtv_smart
+    key_id:
+      name: Key ID
+      description: The ID of the key to send
+      required: true
+      example: "https://home-assistant.io/images/cast/splash.png"
+      selector:
+        text:

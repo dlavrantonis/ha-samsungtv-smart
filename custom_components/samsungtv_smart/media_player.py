@@ -96,6 +96,7 @@ from .const import (
     MAX_WOL_REPEAT,
     SERVICE_SELECT_PICTURE_MODE,
     SERVICE_SET_ART_MODE,
+    SERVICE_REMOTE_KEY,
     STD_APP_LIST,
     WS_PREFIX,
     AppLoadMethod,
@@ -109,6 +110,7 @@ ATTR_DEVICE_MODEL = "device_model"
 ATTR_DEVICE_NAME = "device_name"
 ATTR_IP_ADDRESS = "ip_address"
 ATTR_PICTURE_MODE = "picture_mode"
+ATTR_REMOTE_KEY = "key_id"
 ATTR_PICTURE_MODE_LIST = "picture_mode_list"
 
 CMD_OPEN_BROWSER = "open_browser"
@@ -139,19 +141,35 @@ MAX_CONTROLLED_ENTITY = 4
 
 MIN_TIME_BETWEEN_APP_SCANS = timedelta(seconds=60)
 
+
+SUPPORT_REMOTE_KEYS= 64 #2^35, hass goes up to 2^19
+
 SUPPORT_SAMSUNGTV_SMART = (
     SUPPORT_PAUSE
     | SUPPORT_PLAY
     | SUPPORT_PLAY_MEDIA
     | SUPPORT_STOP
-    | SUPPORT_VOLUME_STEP
     | SUPPORT_VOLUME_MUTE
     | SUPPORT_VOLUME_SET
+    | SUPPORT_VOLUME_STEP
     | SUPPORT_PREVIOUS_TRACK
     | SUPPORT_NEXT_TRACK
     | SUPPORT_SELECT_SOURCE
+    | SUPPORT_SELECT_SOUND_MODE
     | SUPPORT_TURN_ON
     | SUPPORT_TURN_OFF
+    | SUPPORT_REMOTE_KEYS
+)
+
+SUPPORT_SAMSUNGTV_TVONLY = (
+    SUPPORT_VOLUME_MUTE
+    | SUPPORT_VOLUME_SET
+    | SUPPORT_VOLUME_STEP
+    | SUPPORT_SELECT_SOURCE
+    | SUPPORT_SELECT_SOUND_MODE
+    | SUPPORT_TURN_ON
+    | SUPPORT_TURN_OFF
+    | SUPPORT_REMOTE_KEYS
 )
 
 SCAN_INTERVAL = timedelta(seconds=15)
@@ -192,6 +210,14 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         SERVICE_SET_ART_MODE,
         {},
         "async_set_art_mode",
+    )
+
+    platform.async_register_entity_service(
+        SERVICE_REMOTE_KEY,
+        {vol.Required(ATTR_REMOTE_KEY): cv.string},
+        "remote_key",
+        [SUPPORT_REMOTE_KEYS],
+
     )
 
     _LOGGER.info(
@@ -244,6 +270,8 @@ class SamsungTVDevice(MediaPlayerEntity):
 
         # load apps list
         self._dump_apps = True
+        aaa = config.get(CONF_APP_LIST)
+
         app_list = SamsungTVDevice._load_param_list(
             config.get(CONF_APP_LIST)
         )
@@ -313,6 +341,157 @@ class SamsungTVDevice(MediaPlayerEntity):
             logo_file_download=logo_file,
             session=session,
         )
+
+    @property
+    def media_channel(self):
+        """Channel currently playing."""
+        if self._state == STATE_ON:
+            if self._st:
+                if self._st.source in ["digitalTv", "TV"] and self._st.channel != "":
+                    return self._st.channel
+        return None
+
+    @property
+    def media_content_type(self):
+        """Return the content type of current playing media."""
+        if self._state == STATE_ON:
+            if self._running_app == DEFAULT_APP:
+                if self.media_channel:
+                    return MEDIA_TYPE_CHANNEL
+                else:
+                    return MEDIA_TYPE_VIDEO
+            else:
+                return MEDIA_TYPE_APP
+        return STATE_OFF
+
+    @property
+    def app_id(self):
+        """ID of the current running app."""
+        if self._state == STATE_ON:
+            app = None
+            if self._app_list_ST and self._running_app != DEFAULT_APP:
+                app = self._app_list_ST.get(self._running_app, None)
+            if app:
+                return app
+            elif self._st:
+                if not self._st.channel and self._st.channel_name:
+                    return self._st.channel_name
+            return DEFAULT_APP
+        return None
+
+    @property
+    def state(self):
+        """Return the state of the device."""
+
+        # Dionisis Warning: we assume that after a sending a power off command, the command is successful
+        # so for 20 seconds (defined in POWER_OFF_DELAY) the state will be off regardless of the actual state.
+        # This is to have better feedback to the command in the UI, but the logic might cause other issues in the future
+        if self._power_off_in_progress():
+            return STATE_OFF
+
+        return self._state
+
+    @property
+    def source_list(self):
+        """List of available input sources."""
+        # try to get source list from SmartThings if a custom source list is not defined
+        if self._st and self._default_source_used:
+            self._get_st_sources()
+
+        self._gen_installed_app_list()
+
+        source_list = []
+        source_list.extend(list(self._source_list))
+        if self._app_list:
+            source_list.extend(list(self._app_list))
+        if self._channel_list:
+            source_list.extend(list(self._channel_list))
+        return source_list
+
+    @property
+    def channel_list(self):
+        """List of available channels."""
+        if self._channel_list is None:
+            return None
+        return list(self._channel_list)
+
+    @property
+    def source(self):
+        # dionisis
+        """Return the current input source."""
+        return self._get_source()
+
+    @property
+    def sound_mode(self):
+        """Name of the current sound mode."""
+        if self._st:
+            return self._st.sound_mode
+        return None
+
+    @property
+    def sound_mode_list(self):
+        """List of available sound modes."""
+        if self._st:
+            return self._st.sound_mode_list or None
+        return None
+
+    @property
+    def volume_level(self):
+        """Volume level of the media player (0..1)."""
+        # self._volume = int(self._upnp.get_volume()) / 100
+        if self.support_volume_set:
+            return self._volume
+        else:
+            return None
+
+    @property
+    def is_volume_muted(self):
+        """Boolean if volume is currently muted."""
+        # self._muted = self._upnp.get_mute()
+        return self._muted
+
+    @property
+    def device_info(self):
+        """Return a device description for device registry."""
+        dev_info = {
+            ATTR_IDENTIFIERS: {(DOMAIN, f"{self._attr_unique_id}")},
+            ATTR_MANUFACTURER: "Samsung Electronics",
+            ATTR_NAME: self.name,
+            "connections": {(CONNECTION_NETWORK_MAC, self._mac)},
+        }
+        model = self._device_model or "Samsung TV"
+        if self._device_name:
+            model = f"{model} ({self._device_name})"
+        dev_info[ATTR_MODEL] = model
+        if self._device_os:
+            dev_info[ATTR_SW_VERSION] = self._device_os
+
+        return dev_info
+
+    @property
+    def extra_state_attributes(self):
+        """Return the optional state attributes."""
+        data = {
+            ATTR_IP_ADDRESS: self._host
+        }
+        if self._device_model:
+            data[ATTR_DEVICE_MODEL] = self._device_model
+        if self._device_name:
+            data[ATTR_DEVICE_NAME] = self._device_name
+        if self._ws.artmode_status != ArtModeStatus.Unsupported:
+            status_on = self._ws.artmode_status == ArtModeStatus.On
+            data.update({
+                ATTR_ART_MODE_STATUS: STATE_ON if status_on else STATE_OFF
+            })
+        if self._st:
+            picture_mode = self._st.picture_mode
+            picture_mode_list = self._st.picture_mode_list
+            if picture_mode:
+                data[ATTR_PICTURE_MODE] = picture_mode
+            if picture_mode_list:
+                data[ATTR_PICTURE_MODE_LIST] = picture_mode_list
+
+        return data
 
     @staticmethod
     def _load_param_list(src_list):
@@ -692,6 +871,14 @@ class SamsungTVDevice(MediaPlayerEntity):
         if self._state == STATE_OFF:
             self._end_of_power_off = None
 
+        if self._state == STATE_OFF:
+            self._attr_supported_features = SUPPORT_TURN_ON
+        else:
+            if self._get_source() == "TV":
+                self._attr_supported_features = SUPPORT_SAMSUNGTV_TVONLY
+            else:
+                self._attr_supported_features = SUPPORT_SAMSUNGTV_SMART
+
     def send_command(
         self, payload, command_type=CMD_SEND_KEY, key_press_delay: float = 0, press=False
     ):
@@ -823,97 +1010,7 @@ class SamsungTVDevice(MediaPlayerEntity):
 
         return self._get_source()
 
-    @property
-    def media_channel(self):
-        """Channel currently playing."""
-        if self._state == STATE_ON:
-            if self._st:
-                if self._st.source in ["digitalTv", "TV"] and self._st.channel != "":
-                    return self._st.channel
-        return None
 
-    @property
-    def media_content_type(self):
-        """Return the content type of current playing media."""
-        if self._state == STATE_ON:
-            if self._running_app == DEFAULT_APP:
-                if self.media_channel:
-                    return MEDIA_TYPE_CHANNEL
-                else:
-                    return MEDIA_TYPE_VIDEO
-            else:
-                return MEDIA_TYPE_APP
-        return STATE_OFF
-
-    @property
-    def app_id(self):
-        """ID of the current running app."""
-        if self._state == STATE_ON:
-            app = None
-            if self._app_list_ST and self._running_app != DEFAULT_APP:
-                app = self._app_list_ST.get(self._running_app, None)
-            if app:
-                return app
-            elif self._st:
-                if not self._st.channel and self._st.channel_name:
-                    return self._st.channel_name
-            return DEFAULT_APP
-        return None
-
-    @property
-    def state(self):
-        """Return the state of the device."""
-
-        # Warning: we assume that after a sending a power off command, the command is successful
-        # so for 20 seconds (defined in POWER_OFF_DELAY) the state will be off regardless of the actual state.
-        # This is to have better feedback to the command in the UI, but the logic might cause other issues in the future
-        if self._power_off_in_progress():
-            return STATE_OFF
-
-        return self._state
-
-    @property
-    def source_list(self):
-        """List of available input sources."""
-        # try to get source list from SmartThings if a custom source list is not defined
-        if self._st and self._default_source_used:
-            self._get_st_sources()
-
-        self._gen_installed_app_list()
-
-        source_list = []
-        source_list.extend(list(self._source_list))
-        if self._app_list:
-            source_list.extend(list(self._app_list))
-        if self._channel_list:
-            source_list.extend(list(self._channel_list))
-        return source_list
-
-    @property
-    def channel_list(self):
-        """List of available channels."""
-        if self._channel_list is None:
-            return None
-        return list(self._channel_list)
-
-    @property
-    def source(self):
-        """Return the current input source."""
-        return self._get_source()
-
-    @property
-    def sound_mode(self):
-        """Name of the current sound mode."""
-        if self._st:
-            return self._st.sound_mode
-        return None
-
-    @property
-    def sound_mode_list(self):
-        """List of available sound modes."""
-        if self._st:
-            return self._st.sound_mode_list or None
-        return None
 
     def _send_wol_packet(self, wol_repeat=None):
         if not self._mac:
@@ -1041,20 +1138,10 @@ class SamsungTVDevice(MediaPlayerEntity):
         if result:
             await self._async_switch_entity(False)
 
-    @property
-    def volume_level(self):
-        """Volume level of the media player (0..1)."""
-        # self._volume = int(self._upnp.get_volume()) / 100
-        if self.support_volume_set:
-            return self._volume
-        else:
-            return None
+    def remote_key(self,key_id):
+        """send a rc key"""
+        self.send_command(key_id)
 
-    @property
-    def is_volume_muted(self):
-        """Boolean if volume is currently muted."""
-        # self._muted = self._upnp.get_mute()
-        return self._muted
 
     def volume_up(self):
         """Volume up the media player."""
@@ -1228,6 +1315,8 @@ class SamsungTVDevice(MediaPlayerEntity):
 
     async def async_play_media(self, media_type, media_id, **kwargs):
         """Support running different media type command."""
+        _LOGGER.debug('playmedia den')
+
         media_type = media_type.lower()
 
         # Type channel
@@ -1324,49 +1413,6 @@ class SamsungTVDevice(MediaPlayerEntity):
         if not self._st:
             raise NotImplementedError()
         await self._st.async_set_picture_mode(picture_mode)
-
-    @property
-    def device_info(self):
-        """Return a device description for device registry."""
-        dev_info = {
-            ATTR_IDENTIFIERS: {(DOMAIN, f"{self._attr_unique_id}")},
-            ATTR_MANUFACTURER: "Samsung Electronics",
-            ATTR_NAME: self.name,
-            "connections": {(CONNECTION_NETWORK_MAC, self._mac)},
-        }
-        model = self._device_model or "Samsung TV"
-        if self._device_name:
-            model = f"{model} ({self._device_name})"
-        dev_info[ATTR_MODEL] = model
-        if self._device_os:
-            dev_info[ATTR_SW_VERSION] = self._device_os
-
-        return dev_info
-
-    @property
-    def extra_state_attributes(self):
-        """Return the optional state attributes."""
-        data = {
-            ATTR_IP_ADDRESS: self._host
-        }
-        if self._device_model:
-            data[ATTR_DEVICE_MODEL] = self._device_model
-        if self._device_name:
-            data[ATTR_DEVICE_NAME] = self._device_name
-        if self._ws.artmode_status != ArtModeStatus.Unsupported:
-            status_on = self._ws.artmode_status == ArtModeStatus.On
-            data.update({
-                ATTR_ART_MODE_STATUS: STATE_ON if status_on else STATE_OFF
-            })
-        if self._st:
-            picture_mode = self._st.picture_mode
-            picture_mode_list = self._st.picture_mode_list
-            if picture_mode:
-                data[ATTR_PICTURE_MODE] = picture_mode
-            if picture_mode_list:
-                data[ATTR_PICTURE_MODE_LIST] = picture_mode_list
-
-        return data
 
     async def async_will_remove_from_hass(self):
         """Run when entity will be removed from hass."""
