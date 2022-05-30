@@ -144,12 +144,21 @@ This is required for the component to know the name of the TV channel.<br/>
 Check guide [here](https://github.com/jaruba/ha-samsungtv-tizen/blob/master/Logos.md) 
 for updating the logo database this component is relying on.
 
-- **List of entity to Power OFF with TV (comma separated)**<br/>
-A list of HA entity to Turn OFF when the TV entity is turned OFF (maximum 4). 
+- **Allow use of local logo images**<br/>
+(default = True)<br/>
+When enabled the integration will try to get logo image for the current media from the `www/samsungtv_smart_logos` sub folder of home-assistant configuration folder. 
+You can add new logo images in this folder, using the following rules for logo filename:
+  - must be equal to the name of the `media_title` attribute, removing space, `_` and `.` characters and replacing `+` character with
+  the string `plus`
+  - must have the `.png` suffix
+  - must be in `png` format (suggested size is 400x400 pixels)
+
+- **List of entity to Power OFF with TV**<br/>
+A list of HA entity to Turn OFF when the TV entity is turned OFF (maximum 4). Select entities from list. 
 This call the service `homeassistant.turn_off` for maximum the first 4 entity in the provided list.<br/>
 
-- **List of entity to Power ON with TV (comma separated)**<br/>
-A list of HA entity to Turn ON when the TV entity is turned ON (maximum 4).
+- **List of entity to Power ON with TV**<br/>
+A list of HA entity to Turn ON when the TV entity is turned ON (maximum 4).  Select entities from list.
 This call the service `homeassistant.turn_on` for maximum the first 4 entity in the provided list.<br/>
 
 - **Show advanced options**<br/>
@@ -164,20 +173,15 @@ With `All Apps` the list will contain all apps installed on the TV, with `Defaul
 with only the most common application, with `Not Load` application list will be empty.<br/>
 **Note: If a custom `app_list` in `configuration.yaml` file is defined this option is not used.**<br>
 
-- **Applications launch method used**<br/>
-Possible values: `Control Web Socket Channel`, `Remote Web Socket Channel` and `Rest API Call`<br/>
-This option determine the mode used to launch applications.<br/>
-Use `Rest API Call` only if the other 2 methods do not work.<br/>
-
 - **Dump apps list on log file at startup**<br/>
 (default = False)<br/>
 When enabled the component will try to dump the list of available apps on TV in the HA log file at Info level.
 The dump of the apps may not work for some TV models.<br/>
 
-- **Use volume mute status to detect fake power ON**<br/>
-(default = True)<br/>
-When enabled try to detect fake power on based on the Volume mute state, based on the assumption that when the
-TV is powered on the volume is always unmuted.<br/>
+- **Applications launch method used**<br/>
+Possible values: `Control Web Socket Channel`, `Remote Web Socket Channel` and `Rest API Call`<br/>
+This option determine the mode used to launch applications.<br/>
+Use `Rest API Call` only if the other 2 methods do not work.<br/>
 
 - **Number of times WOL packet is sent to turn on TV**<br/>
 (default = 1, range from 1 to 5)<br/>
@@ -188,6 +192,31 @@ until the TV properly turn-on.<br/>
 (default = 30, range from 0 to 60)<br/>
 This option allow to configure a delay to wait before setting the TV status to ON. This is used to avoid false
 ON status for TV that enable the network interface on regular interval also when the TV status is OFF.<br/>
+
+- **TCP port used to check power status**<br/>
+(default = 0, range from 0 to 65535)<br/>
+With this option is possible to check the availability of a specific port to determinate power status instead
+of using ICMP echo. To continue use ICMP echo, leave the value to `0`, otherwise set a port that is known becoming
+available when TV is on (possible working ports, depending on TV models, are `9110`, `9119`, `9197`).</br>
+**N.B. If you set an invalid port here, TV is always reported as `off`.**</br>
+
+- **Binary sensor to help detect power status**<br/>
+An external `binary_sensor` selectable from a list that can be used to determinate TV power status.<br/>
+This can be any available `binary_sensor` that can better determinate the status of the TV, for example a 
+`binary_sensor` based on TV power consumption. It is suggested to not use a sensor based on `ping` platform
+because this method is already implemented by the integration.</br>
+
+- **Use volume mute status to detect fake power ON**<br/>
+(default = True)<br/>
+When enabled try to detect fake power on based on the Volume mute state, based on the assumption that when the
+TV is powered on the volume is always unmuted.<br/>
+
+- **Power button switch to art mode**<br/>
+(default = False)<br/>
+When enabled the power button in UI will be used to toggle from `On` to `Art Mode` (and vice versa) and will not 
+power off the TV (you can still use the `turn off` service to power off the TV).<br/>
+**Note: This option is valid only for TV that support `Art Mode` ("The Frame" models).**<br>
+
 
 ## Custom configuration parameters
 

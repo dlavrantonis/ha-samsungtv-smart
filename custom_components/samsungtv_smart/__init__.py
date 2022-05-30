@@ -1,20 +1,19 @@
 """The samsungtv_smart integration."""
+from __future__ import annotations
 
 from aiohttp import ClientConnectionError, ClientSession, ClientResponseError
-from async_timeout import timeout
 import asyncio
+import async_timeout
 import logging
 import os
-from shutil import copyfile
+from pathlib import Path
 import socket
 import voluptuous as vol
 from websocket import WebSocketException
 
-from .api.samsungws import SamsungTVWS
-from .api.exceptions import ConnectionFailure
+from .api.samsungws import ConnectionFailure, SamsungTVWS
 from .api.smartthings import SmartThingsTV
 
-from homeassistant.components.media_player.const import DOMAIN as MP_DOMAIN
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_DEVICE_ID,
@@ -22,12 +21,18 @@ from homeassistant.const import (
     CONF_BROADCAST_ADDRESS,
     CONF_DEVICE_ID,
     CONF_HOST,
+    CONF_ID,
     CONF_MAC,
     CONF_NAME,
     CONF_PORT,
     CONF_TIMEOUT,
+    CONF_TOKEN,
+    MAJOR_VERSION,
+    MINOR_VERSION,
+    Platform,
+    __version__,
 )
-from homeassistant.core import HomeAssistant
+from homeassistant.core import callback, HomeAssistant
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.storage import STORAGE_DIR
 from homeassistant.helpers.typing import ConfigType
@@ -43,15 +48,21 @@ from .const import (
     CONF_LOAD_ALL_APPS,
     CONF_SOURCE_LIST,
     CONF_SHOW_CHANNEL_NR,
+    CONF_SYNC_TURN_OFF,
+    CONF_SYNC_TURN_ON,
     CONF_WS_NAME,
     CONF_UPDATE_METHOD,
     CONF_UPDATE_CUSTOM_PING_URL,
     CONF_SCAN_APP_HTTP,
+    DATA_CFG_YAML,
     DATA_OPTIONS,
     DEFAULT_PORT,
     DEFAULT_TIMEOUT,
     DEFAULT_SOURCE_LIST,
     DOMAIN,
+    LOCAL_LOGO_PATH,
+    MIN_HA_MAJ_VER,
+    MIN_HA_MIN_VER,
     RESULT_NOT_SUCCESSFUL,
     RESULT_NOT_SUPPORTED,
     RESULT_ST_DEVICE_NOT_FOUND,
@@ -59,7 +70,9 @@ from .const import (
     RESULT_WRONG_APIKEY,
     WS_PREFIX,
     AppLoadMethod,
+    __min_ha_version__,
 )
+from .logo import CUSTOM_IMAGE_BASE_URL, STATIC_IMAGE_BASE_URL
 
 DEVICE_INFO = {
     ATTR_DEVICE_ID: "id",
@@ -120,8 +133,6 @@ CONFIG_SCHEMA = vol.Schema(
     extra=vol.ALLOW_EXTRA,
 )
 
-DATA_LISTENER = "listener"
-
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -129,74 +140,138 @@ def tv_url(host: str, address: str = "") -> str:
     return f"http://{host}:8001/api/v2/{address}"
 
 
+def is_valid_ha_version():
+    return (
+        MAJOR_VERSION > MIN_HA_MAJ_VER or
+        (MAJOR_VERSION == MIN_HA_MAJ_VER and MINOR_VERSION >= MIN_HA_MIN_VER)
+    )
+
+
+def _notify_error(hass, notification_id, title, message):
+    """Notify user with persistent notification"""
+    hass.async_create_task(
+        hass.services.async_call(
+            domain='persistent_notification', service='create', service_data={
+                'title': title,
+                'message': message,
+                'notification_id': f"{DOMAIN}.{notification_id}"
+            }
+        )
+    )
+
+
 def token_file_name(hostname: str) -> str:
     return f"{DOMAIN}_{hostname}_token"
 
 
-def get_token_file(hass, hostname, port, overwrite=False):
-    """Get token file name and try to create it if not exists."""
-    if port != 8002:
-        return None
-
-    token_file = hass.config.path(STORAGE_DIR, token_file_name(hostname))
-
-    if not os.path.isfile(token_file) or overwrite:
-        # Create token file for catch possible errors
-        try:
-            handle = open(token_file, "w+", closefd=True)
-            handle.close()
-        except OSError:
-            _LOGGER.error(
-                "Samsung TV - Error creating token file: %s", token_file
-            )
-            return None
-
-    return token_file
-
-
-def remove_token_file(hass, hostname):
+def _remove_token_file(hass, hostname, token_file=None):
     """Try to remove token file."""
-    token_file = hass.config.path(STORAGE_DIR, token_file_name(hostname))
+    if not token_file:
+        token_file = hass.config.path(STORAGE_DIR, token_file_name(hostname))
 
     if os.path.isfile(token_file):
         try:
             os.remove(token_file)
-        except:
+        except Exception as exc:
             _LOGGER.error(
-                "Samsung TV - Error deleting token file: %s", token_file
+                "Samsung TV - Error deleting token file %s: %s", token_file, str(exc)
             )
 
 
-def _migrate_token_file(hass: HomeAssistant, hostname: str):
-    """Migrate token file from old path to new one."""
-
+def _migrate_token(hass: HomeAssistant, entry: ConfigEntry, hostname: str) -> None:
+    """Migrate token from old file to registry entry."""
     token_file = hass.config.path(STORAGE_DIR, token_file_name(hostname))
-    if os.path.isfile(token_file):
-        return
-
-    old_token_file = (
-        os.path.dirname(os.path.realpath(__file__)) + f"/token-{hostname}.txt"
-    )
-
-    if os.path.isfile(old_token_file):
-        try:
-            copyfile(old_token_file, token_file)
-        except IOError:
-            _LOGGER.error("Failed migration of token file from %s to %s", old_token_file, token_file)
+    if not os.path.isfile(token_file):
+        token_file = (
+            os.path.dirname(os.path.realpath(__file__)) + f"/token-{hostname}.txt"
+        )
+        if not os.path.isfile(token_file):
             return
 
-        try:
-            os.remove(old_token_file)
-        except:
-            _LOGGER.warning("Error while deleting old token file %s", old_token_file)
+    try:
+        with open(token_file, "r") as os_token_file:
+            token = os_token_file.readline()
+    except Exception as exc:
+        _LOGGER.error("Error reading token file %s: %s", token_file, str(exc))
+        return
 
-    return
+    if not token:
+        _LOGGER.warning("No token found inside token file %s", token_file)
+        return
+
+    hass.config_entries.async_update_entry(
+        entry, data={**entry.data, CONF_TOKEN: token}
+    )
+    _remove_token_file(hass, hostname, token_file)
+
+
+@callback
+def _migrate_options_format(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Migrate options to new format."""
+    opt_migrated = False
+    new_options = {}
+
+    for key, option in entry.options.items():
+        if key in [CONF_SYNC_TURN_OFF, CONF_SYNC_TURN_ON]:
+            if isinstance(option, str):
+                new_options[key] = option.split(",")
+                opt_migrated = True
+                continue
+        new_options[key] = option
+
+    if opt_migrated:
+        hass.config_entries.async_update_entry(entry, options=new_options)
+
+
+@callback
+def _migrate_entry_unique_id(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Migrate unique_is to new format."""
+    if CONF_ID in entry.data:
+        new_unique_id = entry.data[CONF_ID]
+    elif CONF_MAC in entry.data:
+        new_unique_id = entry.data[CONF_MAC]
+    else:
+        new_unique_id = entry.data[CONF_HOST]
+
+    if entry.unique_id == new_unique_id:
+        return
+
+    entries_list = hass.config_entries.async_entries(DOMAIN)
+    for other_entry in entries_list:
+        if other_entry.unique_id == new_unique_id:
+            _LOGGER.warning(
+                "Found duplicated entries %s and %s that refer to the same device. Please remove unused entry",
+                entry.data[CONF_HOST],
+                other_entry.data[CONF_HOST],
+            )
+            return
+
+    _LOGGER.info("Migrated entry unique id from %s to %s", entry.unique_id, new_unique_id)
+    hass.config_entries.async_update_entry(entry, unique_id=new_unique_id)
+
+
+def _register_logo_paths(hass: HomeAssistant) -> str | None:
+    """Register paths for local logos."""
+
+    static_logo_path = Path(__file__).parent / "static"
+    hass.http.register_static_path(STATIC_IMAGE_BASE_URL, str(static_logo_path), False)
+
+    local_logo_path = Path(hass.config.path("www", f"{DOMAIN}_logos"))
+    if not local_logo_path.exists():
+        try:
+            local_logo_path.mkdir(parents=True)
+        except Exception as exc:
+            _LOGGER.warning("Error registering custom logo folder %s: %s", str(local_logo_path), exc)
+            return None
+
+    hass.http.register_static_path(CUSTOM_IMAGE_BASE_URL, str(local_logo_path), False)
+    return str(local_logo_path)
 
 
 async def get_device_info(hostname: str, session: ClientSession) -> dict:
     """Try retrieve device information"""
     try:
-        with timeout(2):
+        async with async_timeout.timeout(2):
             async with session.get(
                     tv_url(host=hostname),
                     raise_for_status=True
@@ -231,13 +306,28 @@ class SamsungTVInfo:
         self._hostname = hostname
         self._ws_name = ws_name
         self._ws_port = 0
+        self._ws_token = None
+        self._ping_port = None
 
     @property
     def ws_port(self):
         return self._ws_port
 
+    @property
+    def ws_token(self):
+        return self._ws_token
+
+    @property
+    def ping_port(self):
+        return self._ping_port
+
     def _try_connect_ws(self):
         """Try to connect to device using web sockets on port 8001 and 8002"""
+
+        self._ping_port = SamsungTVWS.ping_probe(self._hostname)
+        if self._ping_port is None:
+            _LOGGER.error("Connection to SamsungTV %s failed. Check that TV is on", self._hostname)
+            return RESULT_NOT_SUCCESSFUL
 
         for port in (8001, 8002):
 
@@ -247,15 +337,14 @@ class SamsungTVInfo:
                     self._hostname,
                     str(port),
                 )
-                token_file = get_token_file(self._hass, self._hostname, port, True)
                 with SamsungTVWS(
                     name=f"{WS_PREFIX} {self._ws_name}",  # this is the name shown in the TV list of external device.
                     host=self._hostname,
                     port=port,
-                    token_file=token_file,
                     timeout=45,  # We need this high timeout because waiting for auth popup is just an open socket
                 ) as remote:
                     remote.open()
+                    self._ws_token = remote.token
                 _LOGGER.info("Found working configuration using port %s", str(port))
                 self._ws_port = port
                 return RESULT_SUCCESS
@@ -270,7 +359,7 @@ class SamsungTVInfo:
         """Try to connect to ST device"""
 
         try:
-            with timeout(10):
+            async with async_timeout.timeout(10):
                 _LOGGER.info(
                     "Try connection to SmartThings TV with id [%s]", device_id
                 )
@@ -298,7 +387,7 @@ class SamsungTVInfo:
         """Get list of available ST devices"""
 
         try:
-            with timeout(4):
+            async with async_timeout.timeout(4):
                 devices = await SmartThingsTV.get_devices_list(
                     api_key, session, st_device_label
                 )
@@ -323,10 +412,17 @@ class SamsungTVInfo:
         return result
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Samsung TV integration."""
+    if not is_valid_ha_version():
+        msg = "This integration require at least HomeAssistant version" \
+              f" {__min_ha_version__}, you are running version {__version__}." \
+              " Please upgrade HomeAssistant to continue use this integration."
+        _notify_error(hass, "inv_ha_version", "SamsungTV Smart", msg)
+        _LOGGER.warning(msg)
+        return True
+
     if DOMAIN in config:
-        hass.data[DOMAIN] = {}
         entries_list = hass.config_entries.async_entries(DOMAIN)
         for entry_config in config[DOMAIN]:
 
@@ -334,7 +430,9 @@ async def async_setup(hass: HomeAssistant, config: ConfigType):
             ip_address = entry_config[CONF_HOST]
 
             # check if already configured
-            valid_entries = [entry for entry in entries_list if entry.unique_id == ip_address]
+            valid_entries = [
+                entry.entry_id for entry in entries_list if entry.data[CONF_HOST] == ip_address
+            ]
             if not valid_entries:
                 _LOGGER.warning(
                     "Found yaml configuration for not configured device %s. Please use UI to configure",
@@ -342,52 +440,69 @@ async def async_setup(hass: HomeAssistant, config: ConfigType):
                 )
                 continue
 
-            hass.data[DOMAIN][ip_address] = {
+            data_yaml = {
                 key: value
                 for key, value in entry_config.items()
                 if key in SAMSMART_SCHEMA and value
             }
+            if data_yaml:
+                if DOMAIN not in hass.data:
+                    hass.data[DOMAIN] = {}
+                hass.data[DOMAIN][valid_entries[0]] = {DATA_CFG_YAML: data_yaml}
+
+    # Register path for local logo
+    if local_logo_path := await hass.async_add_executor_job(_register_logo_paths, hass):
+        hass.data.setdefault(DOMAIN, {})[LOCAL_LOGO_PATH] = local_logo_path
 
     return True
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up the Samsung TV platform."""
+    if not is_valid_ha_version():
+        return False
 
-    # migrate old token file if required
-    _migrate_token_file(hass, entry.unique_id)
+    # migrate unique id to a accepted format
+    _migrate_entry_unique_id(hass, entry)
+
+    # migrate old token file to registry entry if required
+    if CONF_TOKEN not in entry.data:
+        await hass.async_add_executor_job(_migrate_token, hass, entry, entry.data[CONF_HOST])
+
+    # migrate options to new format if required
+    _migrate_options_format(hass, entry)
 
     # setup entry
-    hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN].setdefault(entry.unique_id, {})  # unique_id = host
-    hass.data[DOMAIN][entry.entry_id] = {
-        DATA_OPTIONS: entry.options.copy(),
-        DATA_LISTENER: entry.add_update_listener(update_listener),
-    }
+    entry.async_on_unload(entry.add_update_listener(_update_listener))
+    hass.data.setdefault(DOMAIN, {}).setdefault(entry.entry_id, {})
+    hass.data[DOMAIN][entry.entry_id][DATA_OPTIONS] = entry.options.copy()
 
-    hass.config_entries.async_setup_platforms(entry, [MP_DOMAIN])
+    hass.config_entries.async_setup_platforms(entry, [Platform.MEDIA_PLAYER])
 
     return True
 
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(
-        entry, [MP_DOMAIN]
-    )
-
-    if unload_ok:
-        hass.data[DOMAIN][entry.entry_id][DATA_LISTENER]()
-        remove_token_file(hass, entry.unique_id)
-        hass.data[DOMAIN].pop(entry.entry_id)
-        hass.data[DOMAIN].pop(entry.unique_id)
-        if not hass.data[DOMAIN]:
-            hass.data.pop(DOMAIN)
+    if unload_ok := await hass.config_entries.async_unload_platforms(
+        entry, [Platform.MEDIA_PLAYER]
+    ):
+        hass.data[DOMAIN][entry.entry_id].pop(DATA_OPTIONS)
+        if not hass.data[DOMAIN][entry.entry_id]:
+            hass.data[DOMAIN].pop(entry.entry_id)
 
     return unload_ok
 
 
-async def update_listener(hass: HomeAssistant, entry: ConfigEntry):
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove a config entry."""
+    await hass.async_add_executor_job(_remove_token_file, hass, entry.data[CONF_HOST])
+    if DOMAIN in hass.data:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        if not hass.data[DOMAIN]:
+            hass.data.pop(DOMAIN)
+
+
+async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Update when config_entry options update."""
-    entry_id = entry.entry_id
-    hass.data[DOMAIN][entry_id][DATA_OPTIONS] = entry.options.copy()
+    hass.data[DOMAIN][entry.entry_id][DATA_OPTIONS] = entry.options.copy()

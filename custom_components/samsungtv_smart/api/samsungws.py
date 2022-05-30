@@ -21,48 +21,114 @@ Copyright (C) 2020 Ollo69
 
 """
 import base64
+from datetime import datetime
+from enum import Enum
 import json
 import logging
-import re
 import requests
+import socket
 import ssl
 import subprocess
 import sys
+from threading import Thread, Lock
 import time
+from typing import Any
+from urllib.parse import urlencode, urljoin
 import uuid
 import websocket
-from datetime import datetime
-from enum import Enum
-from threading import Thread, Lock
-from yarl import URL
-from . import exceptions
+
 from . import shortcuts
-
-
-PING_MATCHER = re.compile(
-    r"(?P<min>\d+.\d+)\/(?P<avg>\d+.\d+)\/(?P<max>\d+.\d+)\/(?P<mdev>\d+.\d+)"
-)
-
-PING_MATCHER_BUSYBOX = re.compile(
-    r"(?P<min>\d+.\d+)\/(?P<avg>\d+.\d+)\/(?P<max>\d+.\d+)"
-)
-
-WIN32_PING_MATCHER = re.compile(r"(?P<min>\d+)ms.+(?P<max>\d+)ms.+(?P<avg>\d+)ms")
 
 DEFAULT_POWER_ON_DELAY = 120
 MIN_APP_SCAN_INTERVAL = 10
 MAX_WS_PING_INTERVAL = 10
+PING_TIMEOUT = 3
 TYPE_DEEP_LINK = "DEEP_LINK"
 TYPE_NATIVE_LAUNCH = "NATIVE_LAUNCH"
+
+_WS_ENDPOINT_REMOTE_CONTROL = "/api/v2/channels/samsung.remote.control"
+_WS_ENDPOINT_APP_CONTROL = "/api/v2"
+_WS_ENDPOINT_ART = "/api/v2/channels/com.samsung.art-app"
 
 _LOGGING = logging.getLogger(__name__)
 
 
+def _format_rest_url(host: str, append: str = "") -> str:
+    """Return URL used for rest commands."""
+    return f"http://{host}:8001/api/v2/{append}"
+
+
 def gen_uuid():
+    """Generate new uuid."""
     return str(uuid.uuid4())
 
 
+def kill_subprocess(
+    process: subprocess.Popen[Any],
+) -> None:
+    """Force kill a subprocess and wait for it to exit."""
+    process.kill()
+    process.communicate()
+    process.wait()
+
+    del process
+
+
+class Ping:
+    """Class for handling Ping to a specific host."""
+
+    def __init__(self, host):
+        """Initialize the object."""
+        self._ip_address = host
+        if sys.platform == "win32":
+            self._ping_cmd = ["ping", "-n", "1", "-w", "2000", host]
+        else:
+            self._ping_cmd = ["ping", "-n", "-q", "-c1", "-W2", host]
+
+    def ping(self, port=0):
+        """Check if IP is available using ICMP or trying open a specific port."""
+        if port > 0:
+            return self._ping_socket(port)
+        return self._ping()
+
+    def _ping(self):
+        """Send ICMP echo request and return True if success."""
+        with subprocess.Popen(
+                self._ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        ) as pinger:
+            try:
+                pinger.communicate(timeout=1+PING_TIMEOUT)
+                return pinger.returncode == 0
+            except subprocess.TimeoutExpired:
+                kill_subprocess(pinger)
+                return False
+            except subprocess.CalledProcessError:
+                return False
+
+    def _ping_socket(self, port):
+        """Check if port is available and return True if success."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(PING_TIMEOUT-1)
+            return s.connect_ex((self._ip_address, port)) == 0
+
+
+class ConnectionFailure(Exception):
+    """Error during connection."""
+    pass
+
+
+class ResponseError(Exception):
+    """Error in response."""
+    pass
+
+
+class HttpApiError(Exception):
+    """Error using HTTP API."""
+    pass
+
+
 class App:
+    """Define a TV Application."""
     def __init__(self, app_id, app_name, app_type):
         self.app_id = app_id
         self.app_name = app_name
@@ -70,70 +136,15 @@ class App:
 
 
 class ArtModeStatus(Enum):
+    """Define possible ArtMode status."""
     Unsupported = 0
     Unavailable = 1
     Off = 2
     On = 3
 
 
-class Ping:
-    """The Class for handling the data retrieval."""
-
-    def __init__(self, host, count):
-        """Initialize the data object."""
-        self._ip_address = host
-        self._count = count
-        self.available = False
-
-        if sys.platform == "win32":
-            self._ping_cmd = [
-                "ping",
-                "-n",
-                str(self._count),
-                "-w",
-                "2000",
-                self._ip_address,
-            ]
-        else:
-            self._ping_cmd = [
-                "ping",
-                "-n",
-                "-q",
-                "-c",
-                str(self._count),
-                "-W2",
-                self._ip_address,
-            ]
-
-    def ping(self):
-        """Send ICMP echo request and return details if success."""
-        pinger = subprocess.Popen(
-            self._ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        try:
-            out = pinger.communicate()
-            _LOGGING.debug("Output is %s", str(out))
-            if sys.platform == "win32":
-                match = WIN32_PING_MATCHER.search(str(out).split("\n")[-1])
-                rtt_min, rtt_avg, rtt_max = match.groups()
-            elif "max/" not in str(out):
-                match = PING_MATCHER_BUSYBOX.search(str(out).split("\n")[-1])
-                rtt_min, rtt_avg, rtt_max = match.groups()
-            else:
-                match = PING_MATCHER.search(str(out).split("\n")[-1])
-                rtt_min, rtt_avg, rtt_max, rtt_mdev = match.groups()
-            return True
-        except (subprocess.CalledProcessError, AttributeError):
-            return False
-
-
 class SamsungTVWS:
-
-    _WS_ENDPOINT_REMOTE_CONTROL = "/api/v2/channels/samsung.remote.control"
-    _WS_ENDPOINT_APP_CONTROL = "/api/v2"
-    _WS_ENDPOINT_ART = "/api/v2/channels/com.samsung.art-app"
-
-    _REST_URL_FORMAT = "http://{host}:8001/api/v2/{append}"
+    """Class to manage websocket communication with tizen TV."""
 
     def __init__(
         self,
@@ -146,6 +157,7 @@ class SamsungTVWS:
         name="SamsungTvRemote",
         app_list=None,
     ):
+        """Initialize SamsungTVWS object."""
         self.host = host
         self.token = token
         self.token_file = token_file
@@ -166,31 +178,47 @@ class SamsungTVWS:
         self._app_type = {}
         self._sync_lock = Lock()
         self._last_app_scan = datetime.min
-        self._last_ping = datetime.min
         self._is_connected = False
 
         self._ws_remote = None
         self._client_remote = None
+        self._last_ping = datetime.min
 
         self._ws_control = None
         self._client_control = None
+        self._last_control_ping = datetime.min
 
         self._ws_art = None
         self._client_art = None
+        self._last_art_ping = datetime.min
         self._client_art_supported = 2
 
-        self._ping = Ping(self.host, 1)
+        self._ping = Ping(self.host)
+        self._new_token_callback = None
 
     def __enter__(self):
         return self
 
-    def __exit__(self, type, value, traceback):
+    def __exit__(self, exc_type, exc_value, exc_traceback):
         self.close()
 
-    def _serialize_string(self, string):
+    @staticmethod
+    def ping_probe(host):
+        """Try to ping device and return usable port."""
+        ping = Ping(host)
+        for port in (9197, 0):
+            try:
+                if ping.ping(port):
+                    return port
+            except Exception:
+                _LOGGING.debug("Failed to ping device using port %s", port)
+
+        return None
+
+    @staticmethod
+    def _serialize_string(string):
         if isinstance(string, str):
             string = str.encode(string)
-
         return base64.b64encode(string).decode("utf-8")
 
     def _is_ssl_connection(self):
@@ -198,49 +226,45 @@ class SamsungTVWS:
 
     def _format_websocket_url(self, path, is_ssl=False, use_token=True):
         scheme = "wss" if is_ssl else "ws"
+
+        base_uri = f"{scheme}://{self.host}:{self.port}"
+        ws_uri = urljoin(base_uri, path)
+        query = {"name": self._serialize_string(self.name)}
         if is_ssl and use_token:
-            token = self._get_token()
-        else:
-            token = ""
+            if token := self._get_token():
+                query["token"] = token
+        ws_query = urlencode(query)
+        return f"{ws_uri}?{ws_query}"
 
-        new_uri = URL.build(
-            scheme=scheme,
-            host=self.host,
-            port=self.port,
-            path=path,
-            query={"name": self._serialize_string(self.name)}
-        )
-
-        if token:
-            return str(new_uri.update_query({"token": token}))
-        return str(new_uri)
-
-    def _format_rest_url(self, append=""):
-        params = {
-            "host": self.host,
-            "append": append,
-        }
-
-        return self._REST_URL_FORMAT.format(**params)
+    def register_new_token_callback(self, func):
+        """Register a callback function."""
+        self._new_token_callback = func
 
     def _get_token(self):
+        """Get current token."""
         if self.token_file is not None:
             try:
                 with open(self.token_file, "r") as token_file:
                     return token_file.readline()
-            except:
+            except Exception as exc:
+                _LOGGING.error("Failed to read TV token file: %s", str(exc))
                 return ""
-        else:
-            return self.token
+        return self.token
 
     def _set_token(self, token):
+        """Save new token."""
         _LOGGING.debug("New token %s", token)
         if self.token_file is not None:
             _LOGGING.debug("Save new token to file %s", self.token_file)
             with open(self.token_file, "w") as token_file:
                 token_file.write(token)
-        else:
-            self.token = token
+            return
+
+        if self.token is not None and self.token == token:
+            return
+        self.token = token
+        if self._new_token_callback is not None:
+            self._new_token_callback()
 
     def _ws_send(self, command, key_press_delay=None, *, use_control=False, ws_socket=None):
         using_remote = False
@@ -271,7 +295,7 @@ class SamsungTVWS:
 
         if using_remote:
             # we consider a message sent valid as a ping
-            self._last_ping = datetime.now()
+            self._last_ping = datetime.utcnow()
 
         if key_press_delay is None:
             if self.key_press_delay > 0:
@@ -282,7 +306,7 @@ class SamsungTVWS:
         return True
 
     def _rest_request(self, target, method="GET"):
-        url = self._format_rest_url(target)
+        url = _format_rest_url(self.host, target)
         try:
             if method == "POST":
                 return requests.post(url, timeout=self.timeout)
@@ -293,20 +317,23 @@ class SamsungTVWS:
             else:
                 return requests.get(url, timeout=self.timeout)
         except requests.ConnectionError:
-            raise exceptions.HttpApiError(
+            raise HttpApiError(
                 "TV unreachable or feature not supported on this model."
             )
 
-    def _process_api_response(self, response):
+    @staticmethod
+    def _process_api_response(response, *, raise_error=True):
         try:
             return json.loads(response)
         except json.JSONDecodeError:
             _LOGGING.debug(
                 "Failed to parse response from TV. response text: %s", response
             )
-            raise exceptions.ResponseError(
-                "Failed to parse response from TV. Maybe feature not supported on this model"
-            )
+            if raise_error:
+                raise ResponseError(
+                    "Failed to parse response from TV. Maybe feature not supported on this model"
+                )
+        return response
 
     def _check_conn_id(self, resp_data):
         if not resp_data:
@@ -332,7 +359,7 @@ class SamsungTVWS:
 
         is_ssl = self._is_ssl_connection()
         url = self._format_websocket_url(
-            self._WS_ENDPOINT_REMOTE_CONTROL,
+            _WS_ENDPOINT_REMOTE_CONTROL,
             is_ssl=is_ssl
         )
         sslopt = {"cert_reqs": ssl.CERT_NONE} if is_ssl else {}
@@ -359,13 +386,13 @@ class SamsungTVWS:
         _LOGGING.debug("Thread SamsungRemote terminated")
 
     def _on_ping_remote(self, _, payload):
-        _LOGGING.debug("Received ping %s, sending pong", payload)
-        self._last_ping = datetime.now()
+        _LOGGING.debug("Received WS remote ping %s, sending pong", payload)
+        self._last_ping = datetime.utcnow()
         if self._ws_remote.sock:
             try:
                 self._ws_remote.sock.pong(payload)
             except Exception as ex:
-                _LOGGING.warning("send_pong failed: {}".format(ex))
+                _LOGGING.warning("WS remote send_pong failed, %s", ex)
 
     def _on_message_remote(self, _, message):
         response = self._process_api_response(message)
@@ -375,7 +402,7 @@ class SamsungTVWS:
             return
 
         # we consider a message valid as a ping
-        self._last_ping = datetime.now()
+        self._last_ping = datetime.utcnow()
 
         if event == "ms.channel.connect":
             conn_data = response.get("data")
@@ -421,7 +448,7 @@ class SamsungTVWS:
 
         is_ssl = self._is_ssl_connection()
         url = self._format_websocket_url(
-            self._WS_ENDPOINT_APP_CONTROL,
+            _WS_ENDPOINT_APP_CONTROL,
             is_ssl=is_ssl,
             use_token=False
         )
@@ -431,6 +458,7 @@ class SamsungTVWS:
         self._ws_control = websocket.WebSocketApp(
             url,
             on_message=self._on_message_control,
+            on_ping=self._on_ping_control,
         )
         _LOGGING.debug("Thread SamsungControl started")
         # we set ping interval (1 hour) only to enable multi-threading mode
@@ -441,6 +469,15 @@ class SamsungTVWS:
         self._ws_control.close()
         self._ws_control = None
         _LOGGING.debug("Thread SamsungControl terminated")
+
+    def _on_ping_control(self, _, payload):
+        _LOGGING.debug("Received WS control ping %s, sending pong", payload)
+        self._last_control_ping = datetime.utcnow()
+        if self._ws_control.sock:
+            try:
+                self._ws_control.sock.pong(payload)
+            except Exception as ex:
+                _LOGGING.warning("WS control send_pong failed, %s", ex)
 
     def _on_message_control(self, _, message):
         response = self._process_api_response(message)
@@ -537,7 +574,7 @@ class SamsungTVWS:
 
         is_ssl = self._is_ssl_connection()
         url = self._format_websocket_url(
-            self._WS_ENDPOINT_ART,
+            _WS_ENDPOINT_ART,
             is_ssl=is_ssl,
             use_token=False
         )
@@ -547,6 +584,7 @@ class SamsungTVWS:
         self._ws_art = websocket.WebSocketApp(
             url,
             on_message=self._on_message_art,
+            on_ping=self._on_ping_art,
         )
         _LOGGING.debug("Thread SamsungArt started")
         # we set ping interval (1 hour) only to enable multi-threading mode
@@ -558,12 +596,25 @@ class SamsungTVWS:
         self._ws_art = None
         _LOGGING.debug("Thread SamsungArt terminated")
 
+    def _on_ping_art(self, _, payload):
+        _LOGGING.debug("Received WS art ping %s, sending pong", payload)
+        self._last_art_ping = datetime.utcnow()
+        if self._ws_art.sock:
+            try:
+                self._ws_art.sock.pong(payload)
+            except Exception as ex:
+                _LOGGING.warning("WS art send_pong failed: %s", ex)
+
     def _on_message_art(self, _, message):
         response = self._process_api_response(message)
         _LOGGING.debug(response)
         event = response.get("event")
         if not event:
             return
+
+        # we consider a message valid as a ping
+        self._last_art_ping = datetime.utcnow()
+
         if event == "ms.channel.connect":
             conn_data = response.get("data")
             if not self._check_conn_id(conn_data):
@@ -649,10 +700,15 @@ class SamsungTVWS:
     def running_app(self):
         return self._running_app
 
-    def ping_device(self):
-        result = self._ping.ping()
+    def ping_device(self, port=0):
+        """Ping TV device to check current status, and return boolean.
+            If port is specified, try to open specific port
+            for check, otherwise it uses ICMP echo
+            If check is True, try to open WS connection
+        """
+        result = self._ping.ping(port)
         # check ws ping/pong
-        call_time = datetime.now()
+        call_time = datetime.utcnow()
         if result and self._ws_remote:
             difference = (call_time - self._last_ping).total_seconds()
             result = difference < MAX_WS_PING_INTERVAL
@@ -661,6 +717,8 @@ class SamsungTVWS:
             self.stop_client()
             if self._artmode_status != ArtModeStatus.Unsupported:
                 self._artmode_status = ArtModeStatus.Unavailable
+        elif self._ws_remote:
+            self._check_art_mode()
 
         if self._power_on_requested:
             difference = (call_time - self._power_on_requested_time).total_seconds()
@@ -669,9 +727,20 @@ class SamsungTVWS:
 
         return result
 
+    def _check_art_mode(self):
+        if self._artmode_status == ArtModeStatus.Unsupported:
+            return
+        if self._ws_art:
+            difference = (datetime.utcnow() - self._last_art_ping).total_seconds()
+            if difference >= MAX_WS_PING_INTERVAL:
+                self._artmode_status = ArtModeStatus.Unavailable
+                self._ws_art.close()
+        elif self._ws_remote:
+            self.start_client(start_all=True)
+
     def set_power_on_request(self, set_art_mode=False, power_on_delay=0):
         self._power_on_requested = True
-        self._power_on_requested_time = datetime.now()
+        self._power_on_requested_time = datetime.utcnow()
         self._power_on_artmode = set_art_mode
         self._power_on_delay = max(power_on_delay, 0) or DEFAULT_POWER_ON_DELAY
 
@@ -684,7 +753,7 @@ class SamsungTVWS:
             return
 
         with self._sync_lock:
-            call_time = datetime.now()
+            call_time = datetime.utcnow()
             difference = (call_time - self._last_app_scan).total_seconds()
             if (difference < MIN_APP_SCAN_INTERVAL and not force_scan) or difference < 1:
                 return
@@ -726,10 +795,9 @@ class SamsungTVWS:
                 self._client_control.setDaemon(True)
                 self._client_control.start()
 
-            if (
-                    self._client_art_supported > 0 and
-                    (self._client_art is None or not self._client_art.is_alive())
-               ):
+            if self._client_art_supported > 0 and \
+               (self._client_art is None or not self._client_art.is_alive()):
+
                 if self._client_art_supported > 1:
                     self._client_art_supported = 0
                 self._client_art = Thread(target=self._client_art_thread)
@@ -747,7 +815,7 @@ class SamsungTVWS:
 
         is_ssl = self._is_ssl_connection()
         url = self._format_websocket_url(
-            self._WS_ENDPOINT_REMOTE_CONTROL,
+            _WS_ENDPOINT_REMOTE_CONTROL,
             is_ssl=is_ssl
         )
         sslopt = {"cert_reqs": ssl.CERT_NONE} if is_ssl else {}
@@ -773,7 +841,7 @@ class SamsungTVWS:
 
         if not completed:
             self.close()
-            raise exceptions.ConnectionFailure(response)
+            raise ConnectionFailure(response)
 
         self.connection = connection
         return connection
@@ -903,27 +971,27 @@ class SamsungTVWS:
     def rest_device_info(self):
         _LOGGING.debug("Get device info via rest api")
         response = self._rest_request("")
-        return self._process_api_response(response.text)
+        return self._process_api_response(response.text, raise_error=False)
 
     def rest_app_status(self, app_id):
         _LOGGING.debug("Get app %s status via rest api", app_id)
         response = self._rest_request("applications/" + app_id)
-        return self._process_api_response(response.text)
+        return self._process_api_response(response.text, raise_error=False)
 
     def rest_app_run(self, app_id):
         _LOGGING.debug("Run app %s via rest api", app_id)
         response = self._rest_request("applications/" + app_id, "POST")
-        return self._process_api_response(response.text)
+        return self._process_api_response(response.text, raise_error=False)
 
     def rest_app_close(self, app_id):
         _LOGGING.debug("Close app %s via rest api", app_id)
         response = self._rest_request("applications/" + app_id, "DELETE")
-        return self._process_api_response(response.text)
+        return self._process_api_response(response.text, raise_error=False)
 
     def rest_app_install(self, app_id):
         _LOGGING.debug("Install app %s via rest api", app_id)
         response = self._rest_request("applications/" + app_id, "PUT")
-        return self._process_api_response(response.text)
+        return self._process_api_response(response.text, raise_error=False)
 
     def shortcuts(self):
         return shortcuts.SamsungTVShortcuts(self)
